@@ -214,6 +214,7 @@ impl Tag {
             | Tag::BunTest // for test timeouts
             | Tag::EventLoopDelayMonitor // probably important
             | Tag::StatWatcherScheduler
+            | Tag::FetchConnectAttempt // internal network pacing, never user-visible
             => false,
             _ => true,
         }
