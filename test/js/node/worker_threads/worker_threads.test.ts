@@ -421,6 +421,207 @@ describe("error event", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toMatch(/MessagePort \{.*\}/s);
   });
+
+  test("preserves own enumerable properties of the thrown Error", async () => {
+    const worker = new Worker(
+      /* js */ `
+      const err = new Error("boom");
+      err.code = "E_CUSTOM";
+      err.errno = -2;
+      err.extra = { path: "/tmp/x", n: 42 };
+      throw err;`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("boom");
+    // Own properties must survive the thread boundary so pool libraries can
+    // switch on err.code / err.errno like they do in Node.
+    expect(err.code).toBe("E_CUSTOM");
+    expect(err.errno).toBe(-2);
+    expect(err.extra).toEqual({ path: "/tmp/x", n: 42 });
+  });
+
+  test("preserves the error's own name", async () => {
+    const worker = new Worker(
+      /* js */ `
+      class CustomError extends Error {
+        constructor(msg) { super(msg); this.name = "CustomError"; this.code = "E_SUB"; }
+      }
+      throw new CustomError("boom");`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("CustomError");
+    expect(err.code).toBe("E_SUB");
+  });
+
+  // Node's internal/error_serdes.js materializes `name` as an own property of
+  // the parent-side error and never exposes JSC's line/column/sourceURL. The
+  // expected objects were taken verbatim from Node v26.3.0.
+  test.each([
+    [
+      "Error with custom props",
+      `const e = new Error("boom"); e.code = "E_CUSTOM"; e.extra = { foo: 42 }; throw e;`,
+      { own: ["code", "extra", "message", "name", "stack"], name: "Error", nameIsEnumerable: false },
+    ],
+    [
+      "built-in subclass",
+      `throw new TypeError("boom")`,
+      { own: ["message", "name", "stack"], name: "TypeError", nameIsEnumerable: false },
+    ],
+    [
+      "own enumerable name set by the constructor",
+      `class C extends Error { constructor(m) { super(m); this.name = "CustomError"; this.code = "E_SUB"; } } throw new C("boom");`,
+      { own: ["code", "message", "name", "stack"], name: "CustomError", nameIsEnumerable: true },
+    ],
+  ])("matches Node's own-key set: %s", async (_label, source, expected) => {
+    const worker = new Worker(source, { eval: true });
+    const [err] = await once(worker, "error");
+    expect({
+      own: Object.getOwnPropertyNames(err).sort(),
+      name: err.name,
+      nameIsEnumerable: Object.prototype.propertyIsEnumerable.call(err, "name"),
+    }).toEqual(expected);
+  });
+
+  test("drops non-cloneable own properties instead of losing the whole error", async () => {
+    const worker = new Worker(
+      /* js */ `
+      const err = new Error("boom");
+      err.code = "E_FN";
+      err.fn = () => {};
+      throw err;`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("boom");
+    expect(err.code).toBe("E_FN");
+    expect(err.fn).toBeUndefined();
+  });
+
+  test("preserves integer-indexed own properties on the thrown Error", async () => {
+    const worker = new Worker(
+      /* js */ `
+      const err = new Error("boom");
+      err[0] = "zero";
+      err[2] = "two";
+      err.code = "E_IDX";
+      throw err;`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("boom");
+    expect(err.code).toBe("E_IDX");
+    expect(err[0]).toBe("zero");
+    expect(err[2]).toBe("two");
+  });
+
+  test("a non-cloneable prototype `name` does not cost the error its own properties", async () => {
+    const worker = new Worker(
+      /* js */ `
+      class E extends Error {}
+      E.prototype.name = new WeakMap();
+      const err = new E("boom");
+      err.code = "E_PROTO";
+      throw err;`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    // The pathological prototype name must never sink the [error, props]
+    // serialization: the parent still gets a real Error and its own props.
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("boom");
+    expect(err.code).toBe("E_PROTO");
+    expect(err.name).toBe("Error");
+  });
+
+  test("still delivers an Error instance when own props include a WeakMap", async () => {
+    const worker = new Worker(
+      /* js */ `
+      const err = new Error("boom");
+      err.code = "E_WEAK";
+      err.cache = new WeakMap();
+      throw err;`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    // The WeakMap sinks the own-props clone; the error itself must still
+    // round-trip as an Error instance rather than falling back to a string.
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe("boom");
+    expect(err.cache).toBeUndefined();
+  });
+
+  test("passes non-Error thrown objects through unchanged", async () => {
+    const worker = new Worker(`throw { code: "E_PLAIN", msg: "plain" };`, { eval: true });
+    const [err] = await once(worker, "error");
+    expect(err).toEqual({ code: "E_PLAIN", msg: "plain" });
+  });
+
+  test("passes thrown primitives through unchanged", async () => {
+    const worker = new Worker(`throw 42;`, { eval: true });
+    const [err] = await once(worker, "error");
+    expect(err).toBe(42);
+  });
+
+  test("passes thrown arrays through unchanged", async () => {
+    const worker = new Worker(`throw [1, "two", { three: 3 }];`, { eval: true });
+    const [err] = await once(worker, "error");
+    expect(err).toEqual([1, "two", { three: 3 }]);
+  });
+});
+
+describe("terminate()", () => {
+  test("resolves with exit code 1 for a running worker", async () => {
+    const worker = new Worker(`setInterval(() => {}, 1e9)`, { eval: true });
+    await once(worker, "online");
+    const code = await worker.terminate();
+    expect(code).toBe(1);
+  });
+
+  test("emits exit event with code 1 for a terminated worker", async () => {
+    const worker = new Worker(`setInterval(() => {}, 1e9)`, { eval: true });
+    await once(worker, "online");
+    const exitP = once(worker, "exit");
+    await worker.terminate();
+    const [code] = await exitP;
+    expect(code).toBe(1);
+  });
+
+  test("process.exit() in the worker wins over terminate()'s exit code", async () => {
+    const worker = new Worker(`process.exit(7)`, { eval: true });
+    const [code] = await once(worker, "exit");
+    expect(code).toBe(7);
+  });
+
+  test("resolves with undefined when the worker has already exited", async () => {
+    const worker = new Worker(`/* empty */`, { eval: true });
+    await once(worker, "exit");
+    const code = await worker.terminate();
+    expect(code).toBeUndefined();
+  });
+
+  test("resolves when called repeatedly after exit", async () => {
+    const worker = new Worker(`/* empty */`, { eval: true });
+    await once(worker, "exit");
+    // Before the fix the falsy exit code 0 fell through and awaited a close
+    // event that will never fire again, hanging forever.
+    expect(await worker.terminate()).toBeUndefined();
+    expect(await worker.terminate()).toBeUndefined();
+    expect(await worker.terminate()).toBeUndefined();
+  });
+
+  test("concurrent terminate() calls share the same resolution", async () => {
+    const worker = new Worker(`setInterval(() => {}, 1e9)`, { eval: true });
+    await once(worker, "online");
+    const [a, b] = await Promise.all([worker.terminate(), worker.terminate()]);
+    expect(a).toBe(1);
+    expect(b).toBe(1);
+  });
 });
 
 describe("getHeapSnapshot", () => {

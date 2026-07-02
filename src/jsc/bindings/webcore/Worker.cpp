@@ -27,7 +27,6 @@
 #include "config.h"
 #include "Worker.h"
 
-#include "BunClientData.h"
 #include "ErrorCode.h"
 #include "ErrorEvent.h"
 #include "Event.h"
@@ -39,7 +38,9 @@
 #include <wtf/Scope.h>
 #include "SerializedScriptValue.h"
 #include "ScriptExecutionContext.h"
+#include <JavaScriptCore/ErrorInstance.h>
 #include <JavaScriptCore/JSMap.h>
+#include <JavaScriptCore/ObjectConstructor.h>
 #include <JavaScriptCore/JSModuleLoader.h>
 #include "MessageEvent.h"
 #include "BunWorkerGlobalScope.h"
@@ -500,44 +501,167 @@ void Worker::dispatchErrorWithMessage(WTF::String message)
 
 bool Worker::dispatchErrorWithValue(Zig::GlobalObject* workerGlobalObject, JSValue value)
 {
-    // This is the top of the stack for the worker's error dispatch: both the
-    // structured clone below (even in NonThrowing mode, serialization can run
-    // JS via getters/proxies and leave a pending exception) and the `code`
-    // property read must not propagate exceptions out of this function.
     auto& vm = JSC::getVM(workerGlobalObject);
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    auto scope = DECLARE_THROW_SCOPE(vm);
 
-    auto serialized = SerializedScriptValue::create(*workerGlobalObject, value, SerializationForStorage::No, SerializationErrorMode::NonThrowing);
-    CLEAR_IF_EXCEPTION(scope);
+    // Structured clone of an Error only carries name/message/stack and JSC's
+    // own line/column/sourceURL. Node preserves all own enumerable properties
+    // (code, errno, and anything user-added), so serialize them alongside the
+    // error in a [value, props] pair and reattach on the parent side.
+    JSValue ownProps = jsUndefined();
+    // Node reports `name` as an own property of the parent-side error even
+    // when the worker's error only had it on the prototype chain; in that
+    // case it becomes non-enumerable (internal/error_serdes.js). An own
+    // enumerable `name` travels inside `ownProps` and stays enumerable.
+    JSValue protoName = jsUndefined();
+    if (auto* errorObject = dynamicDowncast<ErrorInstance>(value)) {
+        errorObject->materializeErrorInfoIfNeeded(vm);
+        if (scope.exception()) [[unlikely]] {
+            (void)scope.tryClearException();
+            return false;
+        }
+        JSC::PropertyNameArrayBuilder keys(vm, JSC::PropertyNameMode::Strings, JSC::PrivateSymbolMode::Exclude);
+        errorObject->methodTable()->getOwnPropertyNames(errorObject, workerGlobalObject, keys, JSC::DontEnumPropertiesMode::Exclude);
+        if (scope.exception()) [[unlikely]] {
+            (void)scope.tryClearException();
+            return false;
+        }
+        JSObject* props = JSC::constructEmptyObject(workerGlobalObject);
+        for (const auto& key : keys) {
+            // Carried by the Error clone itself; reattaching them would
+            // only duplicate work.
+            if (key == vm.propertyNames->message || key == vm.propertyNames->stack
+                || key == vm.propertyNames->line || key == vm.propertyNames->column
+                || key == vm.propertyNames->sourceURL)
+                continue;
+            JSValue v = errorObject->get(workerGlobalObject, key);
+            if (scope.exception()) [[unlikely]] {
+                if (!scope.tryClearException())
+                    return false;
+                continue;
+            }
+            // Skip callables and symbols so one non-cloneable field doesn't
+            // make the whole error fall back to a bare string.
+            if (v.isCallable() || v.isSymbol())
+                continue;
+            props->putDirectMayBeIndex(workerGlobalObject, key, v);
+            if (scope.exception()) [[unlikely]] {
+                if (!scope.tryClearException())
+                    return false;
+            }
+        }
+        if (!props->getDirect(vm, vm.propertyNames->name)) {
+            JSValue nameValue = errorObject->get(workerGlobalObject, vm.propertyNames->name);
+            if (scope.exception()) [[unlikely]]
+                (void)scope.tryClearException();
+            // Only a cloneable primitive may ride in the synthesized slot;
+            // an object here (a pathological prototype `name`) would sink
+            // the whole pair and cost the error's real own properties.
+            else if (nameValue.isPrimitive() && !nameValue.isSymbol())
+                protoName = nameValue;
+        }
+        ownProps = props;
+    }
+
+    auto* pair = constructEmptyArray(workerGlobalObject, nullptr, 3);
+    if (scope.exception()) [[unlikely]] {
+        (void)scope.tryClearException();
+        return false;
+    }
+    pair->putDirectIndex(workerGlobalObject, 0, value);
+    if (scope.exception()) [[unlikely]] {
+        (void)scope.tryClearException();
+        return false;
+    }
+    pair->putDirectIndex(workerGlobalObject, 1, ownProps);
+    if (scope.exception()) [[unlikely]] {
+        (void)scope.tryClearException();
+        return false;
+    }
+    pair->putDirectIndex(workerGlobalObject, 2, protoName);
+    if (scope.exception()) [[unlikely]] {
+        (void)scope.tryClearException();
+        return false;
+    }
+
+    auto serialized = SerializedScriptValue::create(*workerGlobalObject, pair, SerializationForStorage::No, SerializationErrorMode::NonThrowing);
+    if (scope.exception()) [[unlikely]]
+        (void)scope.tryClearException();
+    if (!serialized && !ownProps.isUndefined()) {
+        // A non-cloneable own property (WeakMap, Promise, nested function)
+        // sank the pair; retry without the extras so the error itself is
+        // still delivered as an Error instance rather than a bare string.
+        // Keep an (empty) object in the props slot: its presence is how the
+        // parent knows the value was an Error and must have its JSC-internal
+        // line/column/sourceURL own properties stripped.
+        JSValue emptyProps = JSC::constructEmptyObject(workerGlobalObject);
+        if (scope.exception()) [[unlikely]] {
+            (void)scope.tryClearException();
+            emptyProps = jsUndefined();
+        }
+        pair->putDirectIndex(workerGlobalObject, 1, emptyProps);
+        if (scope.exception()) [[unlikely]]
+            (void)scope.tryClearException();
+        pair->putDirectIndex(workerGlobalObject, 2, jsUndefined());
+        if (scope.exception()) [[unlikely]]
+            (void)scope.tryClearException();
+        serialized = SerializedScriptValue::create(*workerGlobalObject, pair, SerializationForStorage::No, SerializationErrorMode::NonThrowing);
+        if (scope.exception()) [[unlikely]]
+            (void)scope.tryClearException();
+    }
     if (!serialized)
         return false;
 
-    // Structured clone keeps only the standard Error fields
-    // (name/message/stack/line/column/sourceURL), but Node's worker 'error'
-    // event preserves `error.code` (lib/internal/error_serdes.js) and the
-    // vendored node tests assert on it (e.g. ERR_TRACE_EVENTS_UNAVAILABLE).
-    // Carry a string `code` across the thread boundary manually. If reading
-    // `code` throws (a throwing getter/proxy), drop the code and proceed.
-    String errorCode;
-    if (value.isObject() && !scope.exception()) {
-        JSValue codeValue = value.getObject()->getIfPropertyExists(workerGlobalObject, WebCore::builtinNames(vm).codePublicName());
-        if (!scope.exception() && codeValue && codeValue.isString())
-            errorCode = codeValue.toWTFString(workerGlobalObject);
-        CLEAR_IF_EXCEPTION(scope);
-    }
-
-    return postTaskToParent([protectedThis = Ref { *this }, serialized, errorCode = WTF::move(errorCode).isolatedCopy()](ScriptExecutionContext& context) {
+    scope.release();
+    return postTaskToParent([protectedThis = Ref { *this }, serialized](ScriptExecutionContext& context) {
         auto* globalObject = context.globalObject();
         auto& vm = JSC::getVM(globalObject);
         auto scope = DECLARE_THROW_SCOPE(vm);
-        ErrorEvent::Init init;
         JSValue deserialized = serialized->deserialize(*globalObject, globalObject, SerializationErrorMode::NonThrowing);
         RETURN_IF_EXCEPTION(scope, );
-        if (!errorCode.isNull()) {
-            if (auto* errorObject = deserialized.getObject())
-                errorObject->putDirect(vm, WebCore::builtinNames(vm).codePublicName(), JSC::jsString(vm, errorCode));
+
+        JSValue errorValue = deserialized;
+        if (auto* arr = dynamicDowncast<JSArray>(deserialized)) {
+            errorValue = arr->getIndex(globalObject, 0);
+            RETURN_IF_EXCEPTION(scope, );
+            JSValue propsValue = arr->getIndex(globalObject, 1);
+            RETURN_IF_EXCEPTION(scope, );
+            JSValue protoName = arr->getIndex(globalObject, 2);
+            RETURN_IF_EXCEPTION(scope, );
+            if (auto* errorObject = errorValue.getObject()) {
+                // A props slot (even an empty one) is only present when the
+                // worker threw an ErrorInstance.
+                if (auto* props = propsValue.getObject()) {
+                    // Node never exposes JSC's line/column/sourceURL on a
+                    // worker error; the Error clone wrote them as lazily
+                    // materialized own properties, so reify before deleting.
+                    if (auto* errorInstance = dynamicDowncast<ErrorInstance>(errorValue)) {
+                        errorInstance->materializeErrorInfoIfNeeded(vm);
+                        RETURN_IF_EXCEPTION(scope, );
+                        for (const auto* internalKey : { &vm.propertyNames->line, &vm.propertyNames->column, &vm.propertyNames->sourceURL }) {
+                            errorObject->deleteProperty(globalObject, *internalKey);
+                            RETURN_IF_EXCEPTION(scope, );
+                        }
+                    }
+                    JSC::PropertyNameArrayBuilder keys(vm, JSC::PropertyNameMode::Strings, JSC::PrivateSymbolMode::Exclude);
+                    props->methodTable()->getOwnPropertyNames(props, globalObject, keys, JSC::DontEnumPropertiesMode::Exclude);
+                    RETURN_IF_EXCEPTION(scope, );
+                    for (const auto& key : keys) {
+                        JSValue v = props->get(globalObject, key);
+                        RETURN_IF_EXCEPTION(scope, );
+                        errorObject->putDirectMayBeIndex(globalObject, key, v);
+                        RETURN_IF_EXCEPTION(scope, );
+                    }
+                    // `name` taken from the prototype chain becomes a
+                    // non-enumerable own property, like Node.
+                    if (!protoName.isUndefined())
+                        errorObject->putDirect(vm, vm.propertyNames->name, protoName, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+                }
+            }
         }
-        init.error = deserialized;
+
+        ErrorEvent::Init init;
+        init.error = errorValue;
 
         auto event = ErrorEvent::create(eventNames().errorEvent, init, EventIsTrusted::Yes);
         protectedThis->dispatchEvent(event);

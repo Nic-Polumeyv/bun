@@ -1191,6 +1191,7 @@ impl WebWorker {
     /// closure — see the note at the bottom of this fn.
     fn shutdown(&self) {
         jsc::mark_binding();
+        let was_running = self.status.get() == Status::Running;
         self.set_status(Status::Terminated);
         bun_analytics::features::workers_terminated.fetch_add(1, Ordering::Relaxed);
         log!("[{}] shutdown", self.execution_context_id);
@@ -1224,6 +1225,15 @@ impl WebWorker {
             // clear it so process.on('exit') handlers can run. teardownJSCVM
             // re-sets it for the JSC VM teardown.
             vm.jsc_vm().clear_has_termination_request();
+            // Node's terminate() resolves to 1 when it interrupts a running
+            // worker (0 if it races startup). Set it before on_exit() so the
+            // worker-side process.on('exit') handler and the parent agree.
+            if was_running
+                && self.has_requested_terminate()
+                && !self.exit_called.load(Ordering::Relaxed)
+            {
+                vm.exit_handler.exit_code = 1;
+            }
             vm.is_shutting_down = true;
             vm.on_exit();
             if let Some(hooks) = runtime_hooks() {

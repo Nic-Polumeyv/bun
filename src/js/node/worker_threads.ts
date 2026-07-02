@@ -463,9 +463,10 @@ class Worker extends EventEmitter {
   #worker: WebWorker;
   #performance;
 
-  // this is used by terminate();
-  // either is the exit code if exited, a promise resolving to the exit code, or undefined if we haven't sent .terminate() yet
-  #onExitPromise: Promise<number> | number | undefined = undefined;
+  // Set by terminate() while termination is in flight so concurrent calls
+  // share the same resolution; cleared once 'close' fires.
+  #onExitPromise: Promise<number> | undefined = undefined;
+  #hasExited = false;
   #urlToRevoke = "";
   // Created only when `options.stdout`/`options.stderr` request capture; the
   // worker's output is not yet routed into them (TODO), but the streams exist
@@ -581,10 +582,13 @@ class Worker extends EventEmitter {
       this.#worker.addEventListener("close", event => callback(null, event.code), { once: true });
     }
 
-    const onExitPromise = this.#onExitPromise;
-    if (onExitPromise) {
-      return $isPromise(onExitPromise) ? onExitPromise : Promise.$resolve(onExitPromise);
+    if (this.#hasExited) {
+      // Node resolves terminate() with undefined once the worker has exited;
+      // falling through would await a 'close' that never fires again.
+      return Promise.$resolve(undefined);
     }
+    const onExitPromise = this.#onExitPromise;
+    if (onExitPromise) return onExitPromise;
 
     const { resolve, promise } = Promise.withResolvers();
     this.#worker.addEventListener(
@@ -609,7 +613,8 @@ class Worker extends EventEmitter {
   }
 
   #onClose(e) {
-    this.#onExitPromise = e.code;
+    this.#hasExited = true;
+    this.#onExitPromise = undefined;
     this.#stdout?.push(null);
     this.#stderr?.push(null);
     this.emit("exit", e.code);
