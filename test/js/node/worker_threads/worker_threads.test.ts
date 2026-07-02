@@ -291,8 +291,7 @@ test("eval does not leak source code", async () => {
   const [errors, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
   if (errors.length > 0) throw new Error(errors);
   expect(exitCode).toBe(0);
-}, // The fixture's leak check needs six workers with 100 MiB of source each
-// (see the sizing note in the fixture); that takes ~30s on a debug+ASAN
+}, // (see the sizing note in the fixture); that takes ~30s on a debug+ASAN // The fixture's leak check needs six workers with 100 MiB of source each
 // build, well over the default per-test budget.
 90_000);
 
