@@ -505,15 +505,16 @@ bool Worker::dispatchErrorWithValue(Zig::GlobalObject* workerGlobalObject, JSVal
     auto scope = DECLARE_THROW_SCOPE(vm);
 
     // Structured clone of an Error only carries name/message/stack and JSC's
-    // own line/column/sourceURL. Node preserves all own enumerable properties
+    // own line/column/sourceURL. Node preserves the own enumerable properties
     // (code, errno, and anything user-added), so serialize them alongside the
-    // error in a [value, props] pair and reattach on the parent side.
+    // error and reattach them on the parent side.
     JSValue ownProps = jsUndefined();
-    // Node reports `name` as an own property of the parent-side error even
-    // when the worker's error only had it on the prototype chain; in that
-    // case it becomes non-enumerable (internal/error_serdes.js). An own
-    // enumerable `name` travels inside `ownProps` and stays enumerable.
-    JSValue protoName = jsUndefined();
+    // Node's internal/error_serdes.js also walks the prototype chain and
+    // materializes what it finds there (`name` from Error.prototype, a `code`
+    // defined on a subclass prototype) as own properties on the receiving
+    // side. Inherited properties that were non-enumerable at their defining
+    // level travel in this second bag and are reattached non-enumerably.
+    JSValue protoDontEnumProps = jsUndefined();
     if (auto* errorObject = dynamicDowncast<ErrorInstance>(value)) {
         errorObject->materializeErrorInfoIfNeeded(vm);
         if (scope.exception()) [[unlikely]] {
@@ -550,17 +551,49 @@ bool Worker::dispatchErrorWithValue(Zig::GlobalObject* workerGlobalObject, JSVal
                     return false;
             }
         }
-        if (!props->getDirect(vm, vm.propertyNames->name)) {
-            JSValue nameValue = errorObject->get(workerGlobalObject, vm.propertyNames->name);
-            if (scope.exception()) [[unlikely]]
+        JSObject* protoProps = JSC::constructEmptyObject(workerGlobalObject);
+        JSObject* level = errorObject->getPrototypeDirect().getObject();
+        auto* objectProto = workerGlobalObject->objectPrototype();
+        while (level && level != objectProto) {
+            JSC::PropertyNameArrayBuilder protoKeys(vm, JSC::PropertyNameMode::Strings, JSC::PrivateSymbolMode::Exclude);
+            level->methodTable()->getOwnPropertyNames(level, workerGlobalObject, protoKeys, JSC::DontEnumPropertiesMode::Include);
+            if (scope.exception()) [[unlikely]] {
                 (void)scope.tryClearException();
-            // Only a cloneable primitive may ride in the synthesized slot;
-            // an object here (a pathological prototype `name`) would sink
-            // the whole pair and cost the error's real own properties.
-            else if (nameValue.isPrimitive() && !nameValue.isSymbol())
-                protoName = nameValue;
+                break;
+            }
+            for (const auto& key : protoKeys) {
+                if (key == vm.propertyNames->message || key == vm.propertyNames->stack
+                    || key == vm.propertyNames->line || key == vm.propertyNames->column
+                    || key == vm.propertyNames->sourceURL || JSC::parseIndex(key))
+                    continue;
+                // The nearest definition in the chain wins.
+                if (props->getDirect(vm, key) || protoProps->getDirect(vm, key))
+                    continue;
+                JSValue v = errorObject->get(workerGlobalObject, key);
+                if (scope.exception()) [[unlikely]] {
+                    if (!scope.tryClearException())
+                        return false;
+                    continue;
+                }
+                // Inherited values are a synthesized convenience: carry only
+                // cloneable primitives so one can never sink the pair and
+                // cost the error's real own properties.
+                if (!v.isPrimitive() || v.isSymbol())
+                    continue;
+                PropertySlot slot(level, PropertySlot::InternalMethodType::GetOwnProperty);
+                bool dontEnum = false;
+                if (level->methodTable()->getOwnPropertySlot(level, workerGlobalObject, key, slot))
+                    dontEnum = slot.attributes() & static_cast<unsigned>(JSC::PropertyAttribute::DontEnum);
+                if (scope.exception()) [[unlikely]] {
+                    (void)scope.tryClearException();
+                    continue;
+                }
+                (dontEnum ? protoProps : props)->putDirect(vm, key, v);
+            }
+            level = level->getPrototypeDirect().getObject();
         }
         ownProps = props;
+        protoDontEnumProps = protoProps;
     }
 
     auto* pair = constructEmptyArray(workerGlobalObject, nullptr, 3);
@@ -578,7 +611,7 @@ bool Worker::dispatchErrorWithValue(Zig::GlobalObject* workerGlobalObject, JSVal
         (void)scope.tryClearException();
         return false;
     }
-    pair->putDirectIndex(workerGlobalObject, 2, protoName);
+    pair->putDirectIndex(workerGlobalObject, 2, protoDontEnumProps);
     if (scope.exception()) [[unlikely]] {
         (void)scope.tryClearException();
         return false;
@@ -626,7 +659,7 @@ bool Worker::dispatchErrorWithValue(Zig::GlobalObject* workerGlobalObject, JSVal
             RETURN_IF_EXCEPTION(scope, );
             JSValue propsValue = arr->getIndex(globalObject, 1);
             RETURN_IF_EXCEPTION(scope, );
-            JSValue protoName = arr->getIndex(globalObject, 2);
+            JSValue protoPropsValue = arr->getIndex(globalObject, 2);
             RETURN_IF_EXCEPTION(scope, );
             if (auto* errorObject = errorValue.getObject()) {
                 // A props slot (even an empty one) is only present when the
@@ -652,10 +685,18 @@ bool Worker::dispatchErrorWithValue(Zig::GlobalObject* workerGlobalObject, JSVal
                         errorObject->putDirectMayBeIndex(globalObject, key, v);
                         RETURN_IF_EXCEPTION(scope, );
                     }
-                    // `name` taken from the prototype chain becomes a
-                    // non-enumerable own property, like Node.
-                    if (!protoName.isUndefined())
-                        errorObject->putDirect(vm, vm.propertyNames->name, protoName, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+                    // Properties materialized from the prototype chain that
+                    // were non-enumerable there stay non-enumerable, like Node.
+                    if (auto* protoProps = protoPropsValue.getObject()) {
+                        JSC::PropertyNameArrayBuilder protoKeys(vm, JSC::PropertyNameMode::Strings, JSC::PrivateSymbolMode::Exclude);
+                        protoProps->methodTable()->getOwnPropertyNames(protoProps, globalObject, protoKeys, JSC::DontEnumPropertiesMode::Exclude);
+                        RETURN_IF_EXCEPTION(scope, );
+                        for (const auto& key : protoKeys) {
+                            JSValue v = protoProps->get(globalObject, key);
+                            RETURN_IF_EXCEPTION(scope, );
+                            errorObject->putDirect(vm, key, v, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum));
+                        }
+                    }
                 }
             }
         }

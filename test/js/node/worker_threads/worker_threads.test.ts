@@ -486,6 +486,38 @@ describe("error event", () => {
     }).toEqual(expected);
   });
 
+  // Bun's internal error codes (and any user class that puts `code` on a
+  // prototype) only expose `code` through the prototype chain; Node's
+  // internal/error_serdes.js walks the chain and materializes what it finds
+  // as own properties. The expected object is Node v26.3.0's output verbatim.
+  test("materializes a prototype-chain `code` as an own property, like Node", async () => {
+    const worker = new Worker(
+      /* js */ `
+      class AppErr extends Error {}
+      AppErr.prototype.code = "E_PROTO_CODE";
+      const err = new AppErr("boom");
+      err.own = 1;
+      throw err;`,
+      { eval: true },
+    );
+    const [err] = await once(worker, "error");
+    expect({
+      isError: err instanceof Error,
+      name: err.name,
+      code: err.code,
+      own: err.own,
+      ownKeys: Object.getOwnPropertyNames(err).sort(),
+      codeIsEnumerable: Object.prototype.propertyIsEnumerable.call(err, "code"),
+    }).toEqual({
+      isError: true,
+      name: "Error",
+      code: "E_PROTO_CODE",
+      own: 1,
+      ownKeys: ["code", "message", "name", "own", "stack"],
+      codeIsEnumerable: true,
+    });
+  });
+
   test("drops non-cloneable own properties instead of losing the whole error", async () => {
     const worker = new Worker(
       /* js */ `
