@@ -280,6 +280,9 @@ describe("execArgv option", async () => {
   // TODO(@190n) get our handling of non-string array elements in line with Node's
 });
 
+// The fixture's leak check needs six workers with 100 MiB of source each (see
+// the sizing note in the fixture); that takes about 30s on a debug+ASAN
+// build, well over the default per-test budget, hence the explicit one.
 test("eval does not leak source code", async () => {
   await using proc = Bun.spawn({
     cmd: [bunExe(), "eval-source-leak-fixture.js"],
@@ -291,8 +294,7 @@ test("eval does not leak source code", async () => {
   const [errors, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
   if (errors.length > 0) throw new Error(errors);
   expect(exitCode).toBe(0);
-}, // build, well over the default per-test budget. // (see the sizing note in the fixture); that takes ~30s on a debug+ASAN // The fixture's leak check needs six workers with 100 MiB of source each
-90_000);
+}, 90_000);
 
 describe("worker event", () => {
   test("is emitted on the next tick with the right value", () => {
