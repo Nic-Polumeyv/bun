@@ -106,6 +106,13 @@ export const lsquic: Dependency = {
     "patches/lsquic/allow-no-sni.patch",
     "patches/lsquic/skip-priority-walk.patch",
     "patches/lsquic/disable-gquic.patch",
+    // node:quic accessors: lsquic_engine_conn_count, lsquic_conn_get_ssl,
+    // lsquic_conn_transport_params, lsquic_conn_make_uni_stream, and the
+    // server-side CONNECTION_CLOSE / IFC_TIMED_OUT immediate-close fixes.
+    "patches/lsquic/node-quic-accessors.patch",
+    // send_packets_out() leaked every packet already coalesced into the
+    // current out_spec when encrypting a later one failed.
+    "patches/lsquic/coalesce-batch-drop.patch",
   ],
 
   fetchDeps: ["zlib", "lshpack", "lsqpack", "boringssl"],
@@ -143,7 +150,9 @@ export const lsquic: Dependency = {
         LSQPACK_ENC_LOGGER_HEADER: "lsquic_qpack_enc_logger.h",
         LSQPACK_DEC_LOGGER_HEADER: "lsquic_qpack_dec_logger.h",
         LSQUIC_DEBUG_NEXT_ADV_TICK: 0,
-        LSQUIC_CONN_STATS: 0,
+        // node:quic's session.stats reads bytes/packets/retx via
+        // lsquic_conn_get_info; those fields are gated on this define.
+        LSQUIC_CONN_STATS: 1,
         LSQUIC_QIR: 0,
         LSQUIC_WEBTRANSPORT_SERVER_SUPPORT: 0,
       },

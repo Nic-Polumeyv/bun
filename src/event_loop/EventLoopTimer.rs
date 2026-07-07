@@ -203,6 +203,8 @@ pub enum Tag {
     BunTest,
     EventLoopDelayMonitor,
     CronJob,
+    QuicEndpoint,
+    QuicSession,
 }
 
 impl Tag {
@@ -212,6 +214,10 @@ impl Tag {
             | Tag::BunTest // for test timeouts
             | Tag::EventLoopDelayMonitor // probably important
             | Tag::StatWatcherScheduler
+            // lsquic ticks are armed with ForceRealTime deadlines; a mocked
+            // clock would stop driving the engine and idle out the connection.
+            | Tag::QuicEndpoint
+            | Tag::QuicSession
             => false,
             _ => true,
         }

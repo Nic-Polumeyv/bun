@@ -87,7 +87,20 @@ int bsd_sendmmsg(LIBUS_SOCKET_DESCRIPTOR fd, struct udp_sendbuf* sendbuf, int fl
             int err = WSAGetLastError();
             if (ret < 0) {
                 if (err == WSAEINTR) continue;
-                if (err == WSAEWOULDBLOCK) return i;
+                /* Winsock reports through WSAGetLastError(), but callers read
+                 * errno -- lsquic closes the connection on any errno that is
+                 * neither EAGAIN/EWOULDBLOCK nor EMSGSIZE. Mirror it. */
+                switch (err) {
+                    case WSAEWOULDBLOCK:  errno = EAGAIN; break;
+                    case WSAEMSGSIZE:     errno = EMSGSIZE; break;
+                    case WSAECONNREFUSED: errno = ECONNREFUSED; break;
+                    case WSAENETUNREACH:  errno = ENETUNREACH; break;
+                    case WSAEHOSTUNREACH: errno = EHOSTUNREACH; break;
+                    default:              errno = EIO; break;
+                }
+                /* Match Linux sendmmsg: report the count sent so far; an
+                 * error is returned only when no datagram was sent. */
+                if (err == WSAEWOULDBLOCK || i > 0) return i;
                 return ret;
             }
             break;
@@ -111,7 +124,9 @@ int bsd_sendmmsg(LIBUS_SOCKET_DESCRIPTOR fd, struct udp_sendbuf* sendbuf, int fl
             ssize_t ret = sendmsg(fd, &sendbuf->msgvec[i].msg_hdr, flags);
             if (ret < 0) {
                 if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) return i;
+                /* Match Linux sendmmsg: report the count sent so far; an
+                 * error is returned only when no datagram was sent. */
+                if (errno == EAGAIN || errno == EWOULDBLOCK || i > 0) return i;
                 return ret;
             }
             break;
